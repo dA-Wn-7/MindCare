@@ -1,7 +1,3 @@
-# MindCare Multimodal Pipeline
-# Whisper + Wav2Vec2 + Strategy Layer + LLM
-# ==============================================
-
 import os
 import re
 import threading
@@ -295,23 +291,39 @@ def build_prompt_messages(user_text, emotion, strategy, chat_history_list):
     final_strategy = get_strategy_with_motivation(user_text, emotion)
     strategy_rule = strategy_instruction_map[final_strategy]
 
-    system_content = f"""You are a mental health support assistant trained in motivational interviewing (MI) and empathetic reflective listening.
+    system_content = f"""You are a mental health support assistant trained in motivational interviewing (MI).
+    YOUR ROLE: You are the ASSISTANT. The user is the USER. 
+    NEVER speak for the user. NEVER generate user responses. 
+    ONLY generate the Assistant's response.
+
 Current Strategy: {strategy_rule}
 Detected Emotion: {emotion}
 
-
 CRITICAL RULES FOR OUTPUT:
-1. Generate ONLY ONE single response to the user's last message.
-2. STOP immediately after your response. Do NOT generate the user's reply.
-3. Do NOT simulate a multi-turn conversation.
-4. Do NOT use labels like "User:", "Assistant:", or "[INST]" in your output.
-5. Keep your response concise (under 100 words if possible).
-6. never rush or push the user
-7. begin by reflecting the user's emotional experience
-8. ask gentle open-ended questions
-9. avoid advice unless user shows readiness
-10. follow the user's pace
+1. Be NATURAL. Do NOT sound like a robot.
+2. **STOP ASKING IF ANSWERED**: If the user has already stated their feeling or answer in the current or previous turn, DO NOT ask for it again. Acknowledge it and move the conversation forward.
+3. If the user explicitly asks for help/advice, PROVIDE CONCISE SUGGESTIONS.
+4. **AVOID REPETITIVE QUESTIONS**: Do not start every response with the same question. Vary your prompts to keep the conversation engaging and natural.
+5. **LISTEN TO OBSTACLES**: If the user says they can't do something (e.g., "I'm afraid to talk to supervisor"), DO NOT suggest doing it again immediately. Acknowledge the fear first.
+6. **ACTIONABLE ADVICE**: When the user asks "How can I do?" or "What should I do?", provide **1-2 VERY SMALL, CONCRETE steps**. Do NOT give a long list. 
+   - Bad: "You should seek support, break down tasks, and practice self-care."
+   - Good: "Since talking to the supervisor feels too big right now, could you try just writing down your top 3 worries on a piece of paper? Just for yourself. No need to show anyone yet."
+7. **VALIDATE FIRST**: Always validate the user's feeling before offering any step.
 
+
+EXAMPLES OF GOOD RESPONSES:
+
+User: "I finished my project!"
+Assistant: "Congratulations! That is a huge accomplishment. You must be very relieved." 
+(Note: No question asked. Just validation.)
+
+User: "I am so proud of myself."
+Assistant: "You have every right to be! All that hard work really paid off. Enjoy this moment."
+(Note: Validated the specific feeling mentioned.)
+
+User: "I'm feeling a bit anxious about the next step."
+Assistant: "It's normal to feel that way after such a big push. What is worrying you the most right now?"
+(Note: Here, a question IS appropriate because the user expressed uncertainty.)
 
 Safety (harm to self or others):
 - If the user expresses intent to harm other people (not only themselves), briefly prioritize safety:
@@ -336,6 +348,17 @@ def _sanitize_assistant_output(text: str) -> str:
     if not text:
         return text
     s = text.strip()
+
+    import unicodedata
+    cleaned_chars = []
+    for char in s:
+        category = unicodedata.category(char)
+        if category.startswith('M') or category.startswith('C'): # Mark or Control
+            continue
+        if 0x1D400 <= ord(char) <= 0x1D7FF:
+            continue
+        cleaned_chars.append(char)
+    s = ''.join(cleaned_chars)
     
     s = re.sub(r"\s*\[/INST\]\s*", "", s, flags=re.IGNORECASE)
     s = re.sub(r"\s*\[INST\]\s*", "", s, flags=re.IGNORECASE)
@@ -392,7 +415,7 @@ def generate_llm_response(prompt_or_messages):
         prompt_text = tokenizer.apply_chat_template(
             prompt_or_messages, 
             tokenize=False, 
-            add_generation_prompt=True
+            # add_generation_prompt=True
         )
         inputs = tokenizer(prompt_text, return_tensors="pt", truncation=True, max_length=1024, padding=True)
 
@@ -408,6 +431,8 @@ def generate_llm_response(prompt_or_messages):
             input_ids=inputs["input_ids"],
             attention_mask=inputs["attention_mask"],
             max_new_tokens=max_new,
+            repetition_penalty=1.15,
+            no_repeat_ngram_size=4,
             temperature=0.7,
             top_p=0.9,
             do_sample=True,
@@ -448,6 +473,63 @@ def mindcare_pipeline(audio_path, chat_history=""):
         "reply": final_reply,
     }
 
+def process_chat_request(user_text: str, chat_history_list: list = None, audio_path: str = None):
+
+    if chat_history_list is None:
+        chat_history_list = []
+
+    if is_crisis(user_text):
+        reply = crisis_and_violence_reply() if is_violence_toward_others(user_text) else CRISIS_REPLY
+        return {
+            "reply": reply,
+            "emotion": "crisis",
+            "strategy": "safety_intervention",
+            "is_safe": False
+        }
+    
+    if is_violence_toward_others(user_text):
+        return {
+            "reply": VIOLENCE_RISK_REPLY,
+            "emotion": "violence_risk",
+            "strategy": "safety_intervention",
+            "is_safe": False
+        }
+
+    if audio_path:
+        emotion = predict_emotion(audio_path, user_text=user_text)
+    else:
+        emotion = infer_emotion_from_text(user_text)
+
+    help_keywords = ["help", "advice", "suggest", "what should i", "how to", "solve"]
+    helpless_keywords = ["don't know how", "lost", "stuck", "can't do", "afraid to"]
+    
+    is_seeking_help = any(k in user_text.lower() for k in help_keywords)
+    is_expressing_helplessness = any(k in user_text.lower() for k in helpless_keywords)
+
+    if is_seeking_help or is_expressing_helplessness:
+        final_strategy = "action_planning"
+        strategy_rule = "User is asking for guidance or feels stuck. Provide ONE very small, low-pressure actionable step. Avoid long lists. Validate their fear first."
+    else:
+        final_strategy = get_strategy_with_motivation(user_text, emotion)
+        strategy_rule = strategy_instruction_map[final_strategy]
+
+
+    messages = build_prompt_messages(
+        user_text=user_text,
+        emotion=emotion,
+        strategy="auto",
+        chat_history_list=chat_history_list
+    )
+
+    _ensure_llm() 
+    reply = generate_llm_response(messages)
+
+    return {
+        "reply": reply,
+        "emotion": emotion,
+        "strategy": get_strategy_with_motivation(user_text, emotion),
+        "is_safe": True
+    }
 
 if __name__ == "__main__":
     # Local demo only; use a real file path for audio.
