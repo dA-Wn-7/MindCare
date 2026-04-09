@@ -31,7 +31,7 @@ def _env_flag(name: str) -> bool:
 
 
 def _whisper_repo_id() -> str:
-    raw = (os.environ.get("MINDCARE_WHISPER_SIZE") or "small").strip().lower()
+    raw = (os.environ.get("MINDCARE_WHISPER_SIZE") or "tiny").strip().lower()
     if raw not in _WHISPER_SIZES:
         raw = "small"
     return f"openai/whisper-{raw}"
@@ -124,18 +124,33 @@ def ensure_pipeline_ready():
 
 
 def speech_to_text(audio_path):
+    print(f"[DEBUG] speech_to_text called with path: {audio_path}")
+    if not audio_path or not os.path.exists(audio_path):
+        print(f"[ERROR] Audio file does not exist: {audio_path}")
+        return "[Audio File Not Found]"
+        
     _ensure_whisper()
-    waveform, sr = torchaudio.load(audio_path)
+    try:
+        waveform, sr = torchaudio.load(audio_path)
+        print(f"[DEBUG] Audio loaded. Shape: {waveform.shape}, SR: {sr}")
 
-    if sr != 16000:
-        waveform = torchaudio.functional.resample(waveform, sr, 16000)
+        if sr != 16000:
+            waveform = torchaudio.functional.resample(waveform, sr, 16000)
+            print(f"[DEBUG] Resampled to 16000")
 
-    inputs = _whisper_processor(waveform.squeeze().numpy(), sampling_rate=16000, return_tensors="pt")
-    inputs = {k: v.to(_DEVICE) for k, v in inputs.items()}
-    with torch.no_grad():
-        generated_ids = whisper_model.generate(**inputs)
-    text = _whisper_processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
-    return text
+        inputs = _whisper_processor(waveform.squeeze().numpy(), sampling_rate=16000, return_tensors="pt")
+        inputs = {k: v.to(_DEVICE) for k, v in inputs.items()}
+        
+        with torch.no_grad():
+            generated_ids = whisper_model.generate(**inputs)
+        
+        text = _whisper_processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
+        print(f"[DEBUG] Transcribed text: {text}")
+        return text
+    except Exception as e:
+        print(f"[ERROR] Exception in speech_to_text: {e}")
+        traceback.print_exc()
+        return f"[Transcription Error: {str(e)}]"
 
 
 emotion_map = {
@@ -286,10 +301,14 @@ strategy_instruction_map = {
         "User shows readiness. Help them define small achievable steps without pressure."
 }
 
-def build_prompt_messages(user_text, emotion, strategy, chat_history_list):
+def build_prompt_messages(user_text, emotion, strategy, chat_history_list, custom_strategy_rule=None):
 
-    final_strategy = get_strategy_with_motivation(user_text, emotion)
-    strategy_rule = strategy_instruction_map[final_strategy]
+    if custom_strategy_rule:
+        strategy_rule = custom_strategy_rule
+    else:
+        final_strategy = get_strategy_with_motivation(user_text, emotion)
+        strategy_rule = strategy_instruction_map.get(final_strategy, strategy_instruction_map["gentle_exploration"])
+
 
     system_content = f"""You are a mental health support assistant trained in motivational interviewing (MI).
     YOUR ROLE: You are the ASSISTANT. The user is the USER. 
@@ -311,20 +330,6 @@ CRITICAL RULES FOR OUTPUT:
 7. **VALIDATE FIRST**: Always validate the user's feeling before offering any step.
 
 
-EXAMPLES OF GOOD RESPONSES:
-
-User: "I finished my project!"
-Assistant: "Congratulations! That is a huge accomplishment. You must be very relieved." 
-(Note: No question asked. Just validation.)
-
-User: "I am so proud of myself."
-Assistant: "You have every right to be! All that hard work really paid off. Enjoy this moment."
-(Note: Validated the specific feeling mentioned.)
-
-User: "I'm feeling a bit anxious about the next step."
-Assistant: "It's normal to feel that way after such a big push. What is worrying you the most right now?"
-(Note: Here, a question IS appropriate because the user expressed uncertainty.)
-
 Safety (harm to self or others):
 - If the user expresses intent to harm other people (not only themselves), briefly prioritize safety:
   ask whether thoughts are fleeting or persistent, whether there is any concrete plan, and encourage
@@ -335,11 +340,20 @@ Safety (harm to self or others):
 - Offer one short grounding step (e.g. slow breathing, change of space) when intense anger or overwhelm appears.
 """
 
-    messages = [{"role": "system", "content": system_content}]
+    # 3. Context Window Management
+    # Keep only the last 6 messages (3 turns) to prevent context pollution and repetition loops.
+    MAX_HISTORY_MESSAGES = 6 
     
+    trimmed_history = []
     if chat_history_list:
-        messages.extend(chat_history_list)
-        
+        if len(chat_history_list) > MAX_HISTORY_MESSAGES:
+            trimmed_history = chat_history_list[-MAX_HISTORY_MESSAGES:]
+        else:
+            trimmed_history = chat_history_list
+
+    # 4. Construct Final Messages
+    messages = [{"role": "system", "content": system_content}]
+    messages.extend(trimmed_history)
     messages.append({"role": "user", "content": user_text})
     
     return messages
@@ -478,6 +492,7 @@ def process_chat_request(user_text: str, chat_history_list: list = None, audio_p
     if chat_history_list is None:
         chat_history_list = []
 
+    # 1. Safety Checks
     if is_crisis(user_text):
         reply = crisis_and_violence_reply() if is_violence_toward_others(user_text) else CRISIS_REPLY
         return {
@@ -495,39 +510,53 @@ def process_chat_request(user_text: str, chat_history_list: list = None, audio_p
             "is_safe": False
         }
 
+    # 2. Emotion Detection
     if audio_path:
         emotion = predict_emotion(audio_path, user_text=user_text)
     else:
         emotion = infer_emotion_from_text(user_text)
 
+    # 3. Strategy Determination
     help_keywords = ["help", "advice", "suggest", "what should i", "how to", "solve"]
     helpless_keywords = ["don't know how", "lost", "stuck", "can't do", "afraid to"]
     
     is_seeking_help = any(k in user_text.lower() for k in help_keywords)
     is_expressing_helplessness = any(k in user_text.lower() for k in helpless_keywords)
 
+    custom_strategy_rule = None
+    
     if is_seeking_help or is_expressing_helplessness:
-        final_strategy = "action_planning"
-        strategy_rule = "User is asking for guidance or feels stuck. Provide ONE very small, low-pressure actionable step. Avoid long lists. Validate their fear first."
+        # Override strategy for helplessness/help-seeking
+        custom_strategy_rule = "User is asking for guidance or feels stuck. Provide ONE very small, low-pressure actionable step. Avoid long lists. Validate their fear first. Do NOT ask open-ended questions like 'how does that make you feel'."
     else:
+        # Use default strategy logic
         final_strategy = get_strategy_with_motivation(user_text, emotion)
-        strategy_rule = strategy_instruction_map[final_strategy]
+        # We don't need to pass custom_strategy_rule, so build_prompt_messages will use default map
 
-
+    # 4. Build Prompt
     messages = build_prompt_messages(
         user_text=user_text,
         emotion=emotion,
-        strategy="auto",
-        chat_history_list=chat_history_list
+        strategy="auto", # This param is ignored if custom_strategy_rule is present
+        chat_history_list=chat_history_list,
+        custom_strategy_rule=custom_strategy_rule # Pass the custom rule here
     )
 
+    # 5. Generate Response
     _ensure_llm() 
     reply = generate_llm_response(messages)
+
+    # 6. Return Result
+    # Determine final strategy name for logging
+    if custom_strategy_rule:
+        logged_strategy = "action_planning_helpless"
+    else:
+        logged_strategy = get_strategy_with_motivation(user_text, emotion)
 
     return {
         "reply": reply,
         "emotion": emotion,
-        "strategy": get_strategy_with_motivation(user_text, emotion),
+        "strategy": logged_strategy,
         "is_safe": True
     }
 

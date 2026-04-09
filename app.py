@@ -1,9 +1,7 @@
-from peft import PeftModel
 import os
 import sys
 import sqlite3
 from pathlib import Path
-import html
 import traceback
 import torch
 from datetime import datetime
@@ -13,7 +11,6 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 import gradio as gr
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
 # Import existing modules
 from modules.safety import (
@@ -28,10 +25,8 @@ from modules.safety import (
 from modules.pipelines.p import (
     process_chat_request,
     ensure_pipeline_ready,
-    build_prompt_messages,
     infer_emotion_from_text,
-    generate_llm_response,
-    _ensure_llm
+    speech_to_text,
 )
 
 # ==========================================
@@ -47,15 +42,6 @@ DISCLAIMER_MD = """
 """
 
 _DB_PATH = os.environ.get("MINDCARE_DB_PATH", "mindcare_logs.db")
-BASE_MODEL_NAME = "mistralai/Mistral-7B-Instruct-v0.2" 
-FINETUNED_MODEL_REPO = os.environ.get("MINDCARE_LLM_REPO", "imnotdawn/mistral7b-qlora-sft-small-v2.1")
-
-# Global variables for models
-tokenizer_ft = None
-model_ft = None
-tokenizer_base = None
-model_base = None
-_DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 def _env_flag(name: str) -> bool:
     return os.environ.get(name, "").lower() in ("1", "true", "yes")
@@ -72,144 +58,24 @@ def init_db():
     c = conn.cursor()
     c.execute("""CREATE TABLE IF NOT EXISTS interactions
                  (timestamp TEXT, user_text TEXT, emotion TEXT, strategy TEXT, 
-                  reply_base TEXT, reply_ft TEXT, preferred_model TEXT)""")
+                  reply TEXT)""")
     conn.commit()
     conn.close()
 
-def log_preference(user_text, emotion, strategy, reply_base, reply_ft, preferred_model):
+def log_interaction(user_text, emotion, strategy, reply):
     if not _logging_enabled():
         return
     try:
         conn = sqlite3.connect(_DB_PATH)
         c = conn.cursor()
         c.execute(
-            "INSERT INTO interactions VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (datetime.now().isoformat(), user_text, emotion, strategy, 
-             reply_base[:1000], reply_ft[:1000], preferred_model)
+            "INSERT INTO interactions VALUES (?, ?, ?, ?, ?)",
+            (datetime.now().isoformat(), user_text, emotion, strategy, reply[:1000])
         )
         conn.commit()
         conn.close()
     except Exception as e:
         print(f"DB Error: {e}")
-
-# ==========================================
-# Model Loading Helpers
-# ==========================================
-
-def load_finetuned_model():
-    """
-    Loads the FT model. Note: p.py also loads an LLM instance. 
-    To avoid double loading VRAM, we can try to reuse p.py's model if possible,
-    but for A/B testing clarity, we often keep separate instances or ensure 
-    p.py's instance is used for FT generation.
-    
-    Here, we will align app.py's FT model with p.py's logic by ensuring 
-    p.py is initialized, and then we load Base separately for comparison.
-    """
-    global tokenizer_ft, model_ft
-    
-    # We rely on p.py's ensure_pipeline_ready to load the main LLM (which is the FT one usually)
-    # But for explicit A/B in app.py, let's load them explicitly if not already done by p.py
-    
-    if model_ft is None:
-        print(f"Loading Fine-tuned Model (LoRA): {FINETUNED_MODEL_REPO}...")
-        try:
-            tokenizer_ft = AutoTokenizer.from_pretrained(FINETUNED_MODEL_REPO)
-            if tokenizer_ft.pad_token_id is None:
-                tokenizer_ft.pad_token_id = tokenizer_ft.eos_token_id
-            
-            use_4bit = _env_flag("MINDCARE_LLM_LOAD_IN_4BIT")
-            qconfig = None
-            if use_4bit:
-                qconfig = BitsAndBytesConfig(
-                    load_in_4bit=True,
-                    bnb_4bit_compute_dtype=torch.float16,
-                    bnb_4bit_quant_type="nf4",
-                )
-
-            print("Loading Base Model for LoRA attachment...")
-            base_model_for_lora = AutoModelForCausalLM.from_pretrained(
-                BASE_MODEL_NAME,
-                quantization_config=qconfig,
-                device_map="auto",
-                torch_dtype=torch.float16,
-            )
-            
-            print("Attaching LoRA Adapter...")
-            model_ft = PeftModel.from_pretrained(base_model_for_lora, FINETUNED_MODEL_REPO)
-            model_ft.eval()
-            print("Fine-tuned Model (LoRA) Loaded Successfully.")
-            
-        except Exception as e:
-            print(f"Failed to load FT model: {e}")
-            traceback.print_exc()
-            raise e
-
-def load_base_model():
-    global tokenizer_base, model_base
-    if model_base is None:
-        print(f"Loading Base Model: {BASE_MODEL_NAME}...")
-        try:
-            tokenizer_base = AutoTokenizer.from_pretrained(BASE_MODEL_NAME)
-            if tokenizer_base.pad_token_id is None:
-                tokenizer_base.pad_token_id = tokenizer_base.eos_token_id
-                
-            use_4bit = _env_flag("MINDCARE_LLM_LOAD_IN_4BIT")
-            qconfig = None
-            if use_4bit:
-                qconfig = BitsAndBytesConfig(
-                    load_in_4bit=True,
-                    bnb_4bit_compute_dtype=torch.float16,
-                    bnb_4bit_quant_type="nf4",
-                )
-
-            model_base = AutoModelForCausalLM.from_pretrained(
-                BASE_MODEL_NAME,
-                quantization_config=qconfig,
-                device_map="auto",
-                torch_dtype=torch.float16,
-            )
-            model_base.eval()
-            print("Base Model Loaded Successfully.")
-        except Exception as e:
-            print(f"Failed to load Base model: {e}")
-            raise e
-
-def generate_response(model, tokenizer, messages, max_new_tokens=256):
-    """Generic generation function for Base Model comparison"""
-    try:
-        prompt_text = tokenizer.apply_chat_template(
-            messages, 
-            tokenize=False, 
-            add_generation_prompt=True
-        )
-        inputs = tokenizer(prompt_text, return_tensors="pt", truncation=True, max_length=2048, padding=True)
-        inputs = {k: v.to(_DEVICE) for k, v in inputs.items()}
-        
-        with torch.no_grad():
-            output = model.generate(
-                input_ids=inputs["input_ids"],
-                attention_mask=inputs["attention_mask"],
-                max_new_tokens=max_new_tokens,
-                temperature=0.7,
-                top_p=0.9,
-                do_sample=True,
-                pad_token_id=tokenizer.eos_token_id,
-                eos_token_id=tokenizer.eos_token_id,
-                repetition_penalty=1.1,
-                no_repeat_ngram_size=3,
-            )
-        
-        input_len = inputs["input_ids"].shape[1]
-        new_tokens = output[0][input_len:]
-        raw = tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
-        
-        if "[/INST]" in raw:
-            raw = raw.split("[/INST]")[-1].strip()
-        return raw
-    except Exception as e:
-        print(f"Generation Error: {e}")
-        return "Error generating response."
 
 # ==========================================
 # Mood Selection & Opening Logic
@@ -276,128 +142,119 @@ BUFFERING_ANIMATION_HTML = """
 </div>
 """
 
-def generate_opening_messages(mood_key):
+def generate_opening_message(mood_key):
+    """Generates only the MindCare AI opening message"""
     mood_data = MOOD_OPTIONS.get(mood_key, MOOD_OPTIONS["winter_snow"])
     
-    system_content = f"""You are a warm, empathetic mental health companion. 
-The user has indicated their current emotional state by choosing a metaphor: "{mood_data['label']}".
-Context: {mood_data['prompt_hint']}
-
-Task: 
-Generate a VERY SHORT (under 50 words), warm, and inviting opening message. 
-Acknowledge their feeling gently. Do NOT ask too many questions yet. Just let them know you are here with them.
-"""
-    
-    messages = [
-        {"role": "system", "content": system_content},
-        {"role": "user", "content": f"I feel like {mood_data['label']}."}
-    ]
-    
-    try:
-        load_base_model()
-        load_finetuned_model()
-        
-        print("Generating Base Response...")
-        reply_base = generate_response(model_base, tokenizer_base, messages)
-        
-        print("Generating FT Response...")
-        reply_ft = generate_response(model_ft, tokenizer_ft, messages)
-        
-        return reply_base, reply_ft
-    except Exception as e:
-        print(f"CRITICAL ERROR in generate_opening_messages: {e}")
-        traceback.print_exc()
-        return f"Error: {str(e)[:50]}", f"Error: {str(e)[:50]}"
+    welcomes = {
+        "sunny_day": "Hello! I'm so glad to see your sunny disposition. I'm here to share in your joy.",
+        "spring_rain": "Hello. I sense a gentle melancholy, like spring rain. I'm here to listen whenever you're ready.",
+        "summer_storm": "Hello. I hear the intensity of your feelings. I'm here to help you find some calm.",
+        "autumn_wind": "Hello. I sense you might be feeling a bit lost or lonely. I'm here to keep you company.",
+        "winter_snow": "Hello. I sense you might be feeling numb or exhausted. I'm here to offer gentle warmth."
+    }
+    return welcomes.get(mood_key, "Hello. I'm here for you.")
 
 def start_chat_session_ui(mood_key, history):
     if not mood_key:
-        return history, history, gr.update(visible=True), gr.update(visible=False), "", "", ""
+        return history, gr.update(visible=True), gr.update(visible=False), "", mood_key
 
-    reply_base, reply_ft = generate_opening_messages(mood_key)
+    reply_ft = generate_opening_message(mood_key)
     
-    combined_msg = f"**Option A (Base Model):**\n{reply_base}\n\n---\n\n**Option B (MindCare AI):**\n{reply_ft}"
+    new_history = [
+        {"role": "user", "content": f"Mood Selected: {MOOD_OPTIONS[mood_key]['label']}"},
+        {"role": "assistant", "content": reply_ft}
+    ]
     
-    new_history = [(f"Mood Selected: {MOOD_OPTIONS[mood_key]['label']}", combined_msg)]
-    
-    return new_history, new_history, gr.update(visible=False), gr.update(visible=True), reply_base, reply_ft, mood_key
+    return new_history, gr.update(visible=False), gr.update(visible=True), reply_ft, mood_key
 
 
 # ==========================================
-# Normal Chat Logic with A/B Testing (Enhanced)
+# Normal Chat Logic (Single Model)
 # ==========================================
 
-def process_normal_chat_ab(text, history, mood_state, llm_history_state):
+def process_chat_single_model(text, audio_path, history, llm_history_state):
     """
-    Generates responses from BOTH Base and FT models for A/B testing.
-    Option B now uses the advanced logic from p.py (process_chat_request).
+    Handles both text and audio input for the single MindCare AI model.
     """
-    if not text:
-        return history, history, llm_history_state, "", ""
+    # Debug log entry
+    print(f"[DEBUG APP] process_chat_single_model entered. Text: {text}, Audio: {audio_path}")
 
-    # 1. Update UI to show user message and "Thinking..."
-    display_history = history + [(text, "⏳ Generating responses from both models...")]
-    yield display_history, display_history, llm_history_state, "", "" 
+    if not text and not audio_path:
+        yield history, llm_history_state, ""
+        return
 
-    reply_base = "Error generating base response."
-    reply_ft = "Error generating FT response."
+    # 1. Determine User Text
+    user_text = text
+    original_audio_path = None
+
+    if audio_path and not text:
+        original_audio_path = audio_path
+        try:
+            print(f"[DEBUG APP] Starting speech_to_text for: {audio_path}")
+            user_text = speech_to_text(audio_path)
+            print(f"[DEBUG APP] Transcribed text: {user_text}")
+            if not user_text:
+                user_text = "[Could not understand audio]"
+        except Exception as e:
+            print(f"[ERROR APP] Audio Processing Error: {e}")
+            traceback.print_exc()
+            user_text = f"[Audio Error: {str(e)}]"
+
+    if not user_text:
+        yield history, llm_history_state, ""
+        return
+
+    # 2. Update UI to show user message and "Thinking..."
+    display_history = list(history)
+    display_history.append({"role": "user", "content": user_text})
+    display_history.append({"role": "assistant", "content": "⏳ MindCare is listening..."})
+    
+    yield display_history, llm_history_state, "" 
+
+    reply_ft = "Error generating response."
     ft_strategy = "unknown"
     ft_emotion = "unknown"
 
     try:
-        # Ensure models are loaded
-        if model_base is None: load_base_model()
-        if model_ft is None: load_finetuned_model()
-        
-        # Ensure p.py's pipeline is ready (loads LLM if not already, and other components)
+        # Ensure pipeline is ready
         ensure_pipeline_ready()
             
         current_llm_history = llm_history_state or []
         
-        # --- OPTION A: Base Model (Simple Prompt for Baseline) ---
-        simple_messages = [{"role": "system", "content": "You are a supportive mental health companion."}]
-        simple_messages.extend(current_llm_history)
-        simple_messages.append({"role": "user", "content": text})
-        
-        print("Generating Base Response...")
-        reply_base = generate_response(model_base, tokenizer_base, simple_messages, max_new_tokens=256)
-        
-        # --- OPTION B: FT Model (Advanced Prompt via p.py) ---
-        print("Generating FT Response with Advanced Pipeline...")
-        # Use the unified interface from p.py
+        # --- Generate Response using p.py ---
         result_ft = process_chat_request(
-            user_text=text,
+            user_text=user_text,
             chat_history_list=current_llm_history,
-            audio_path=None # Text-only mode for now
+            audio_path=original_audio_path
         )
         reply_ft = result_ft["reply"]
         ft_strategy = result_ft.get("strategy", "unknown")
         ft_emotion = result_ft.get("emotion", "unknown")
         
     except Exception as e:
-        print(f"Error in A/B generation: {e}")
+        print(f"Error in generation: {e}")
         traceback.print_exc()
-        reply_base = f"Base Model Error: {str(e)[:50]}"
-        reply_ft = f"FT Model Error: {str(e)[:50]}"
+        reply_ft = f"Error: {str(e)[:100]}"
 
-    # 2. Format the combined message for Display
-    combined_msg = f"**Option A (Base Model):**\n{reply_base}\n\n---\n\n**Option B (MindCare AI):**\n{reply_ft}"
-    
     # 3. Update Display History
-    display_history[-1] = (text, combined_msg)
+    if display_history and display_history[-1]["role"] == "assistant":
+        display_history[-1]["content"] = reply_ft
+    else:
+        display_history.append({"role": "assistant", "content": reply_ft})
     
     # 4. Update LLM Internal History
-    # We use the FT response (which follows MI principles) to maintain context consistency
     new_llm_history = current_llm_history + [
-        {"role": "user", "content": text},
+        {"role": "user", "content": user_text},
         {"role": "assistant", "content": reply_ft} 
     ]
     
     # 5. Log the interaction
     if _logging_enabled():
-        log_preference(text, ft_emotion, ft_strategy, reply_base, reply_ft, "pending")
+        log_interaction(user_text, ft_emotion, ft_strategy, reply_ft)
 
     # 6. Return updated states
-    yield display_history, display_history, new_llm_history, reply_base, reply_ft
+    yield display_history, new_llm_history, reply_ft
 
 
 # ==========================================
@@ -407,22 +264,19 @@ def process_normal_chat_ab(text, history, mood_state, llm_history_state):
 if _logging_enabled():
     init_db()
 
-# Initialize models on startup to avoid long wait on first click
+# Initialize models on startup
 print("Starting MindCare Application...")
 try:
-    ensure_pipeline_ready() # Loads p.py models
-    load_base_model()       # Loads base model for comparison
-    load_finetuned_model()  # Loads FT model explicitly for app control if needed
+    ensure_pipeline_ready() 
 except Exception as e:
-    print(f"Warning: Could not pre-load all models: {e}")
+    print(f"Warning: Could not pre-load models: {e}")
 
 with gr.Blocks(theme=gr.themes.Soft()) as app:
     gr.Markdown("# MindCare 🧠")
     gr.Markdown(DISCLAIMER_MD)
 
     # State variables
-    last_base_reply = gr.State("")
-    last_ft_reply = gr.State("")
+    last_reply = gr.State("") # To store the last reply for potential feedback/logging
     current_mood = gr.State("")
     llm_internal_history = gr.State([]) # Clean history for LLM context
 
@@ -450,16 +304,8 @@ with gr.Blocks(theme=gr.themes.Soft()) as app:
 
     # --- View 3: Chat Interface ---
     with gr.Column(visible=False) as chat_interface_col:
-        chatbot = gr.Chatbot(label="Conversation", height=500, bubble_full_width=False)
-        state_history = gr.State([]) # Display history
-
-        # Preference Buttons
-        with gr.Row():
-            prefer_base_btn = gr.Button("👍 Prefer Base Model", variant="secondary")
-            prefer_ft_btn = gr.Button("👍 Prefer MindCare AI", variant="primary")
+        chatbot = gr.Chatbot(label="Conversation", height=500, type="messages")
         
-        pref_status = gr.Markdown("", visible=False)
-
         with gr.Row():
             with gr.Column(scale=8):
                 text_input = gr.Textbox(
@@ -468,6 +314,7 @@ with gr.Blocks(theme=gr.themes.Soft()) as app:
                     container=False
                 )
             with gr.Column(scale=1):
+                # Audio input now directly triggers chat
                 audio_input = gr.Audio(sources=["microphone", "upload"], type="filepath", label="Audio", show_label=False)
 
         submit_btn = gr.Button("Send", variant="primary")
@@ -487,94 +334,45 @@ with gr.Blocks(theme=gr.themes.Soft()) as app:
             outputs=[mood_selector_col, buffering_display, chat_interface_col]
         ).then(
             fn=start_chat_session_ui,
-            inputs=[gr.State(key), state_history],
-            outputs=[chatbot, state_history, buffering_display, chat_interface_col, last_base_reply, last_ft_reply, current_mood]
+            inputs=[gr.State(key), chatbot],
+            outputs=[chatbot, buffering_display, chat_interface_col, last_reply, current_mood]
         )
 
-    # Bind Submit Button (A/B Test Chat)
-    submit_btn.click(
-        fn=process_normal_chat_ab,
-        inputs=[text_input, state_history, current_mood, llm_internal_history],
-        outputs=[chatbot, state_history, llm_internal_history, last_base_reply, last_ft_reply]
-    )
-
-    def process_audio_chat(audio_path, history, mood_state, llm_history_state):
+    def handle_audio_upload(audio_path, history, llm_hist):
+        print(f"[DEBUG GRADIO] Audio upload event triggered. Path: {audio_path}")
         if not audio_path:
-            return history, history, llm_history_state, "", ""
-
-        from modules.pipelines.p import speech_to_text
+            return history, llm_hist, ""
+        
+        gen = process_chat_single_model("", audio_path, history, llm_hist)
+        
+        final_result = None
         try:
-            user_text = speech_to_text(audio_path)
+            for result in gen:
+                final_result = result
+            return final_result if final_result else (history, llm_hist, "")
         except Exception as e:
-            user_text = f"[Audio Error: {str(e)}]"
-            
-        if not user_text:
-            return history, history, llm_history_state, "", ""
-        
-        gen = process_normal_chat_ab(user_text, history, mood_state, llm_history_state)
-        
-        step1 = next(gen) 
-        step2 = next(gen)
-        
-        return step2
-    def handle_user_interaction(text, audio_path, history, mood_state, llm_history_state):
+            print(f"Error in audio handling: {e}")
+            traceback.print_exc()
+            return history, llm_hist, f"Error: {str(e)}"
 
-        user_text = text
-    
-        if audio_path and not text:
-            try:
-                from modules.pipelines.p import speech_to_text
-                user_text = speech_to_text(audio_path)
-            except Exception as e:
-                user_text = f"[Audio Processing Error]"
-
-        if not user_text:
-            return history, history, llm_history_state, "", ""
-
-        gen = process_normal_chat_ab(user_text, history, mood_state, llm_history_state)
-
-        try:
-            next(gen) # Skip thinking state for simplicity in upload, or handle it if you want streaming
-            final_state = next(gen)
-            return final_state
-        except StopIteration:
-            return history, history, llm_history_state, "", ""
-
-# 在 Gradio Blocks 中：
-
-    # Bind Submit Button
     submit_btn.click(
-        fn=lambda t, h, m, l: handle_user_interaction(t, None, h, m, l),
-        inputs=[text_input, state_history, current_mood, llm_internal_history],
-        outputs=[chatbot, state_history, llm_internal_history, last_base_reply, last_ft_reply]
+        fn=process_chat_single_model, 
+        inputs=[text_input, gr.State(None), chatbot, llm_internal_history],
+        outputs=[chatbot, llm_internal_history, last_reply]
+    ).then(
+        fn=lambda: "", 
+        inputs=None,
+        outputs=[text_input]
     )
 
-    # Bind Audio Upload
-    audio_input.upload(
-        fn=lambda t, a, h, m, l: handle_user_interaction(t, a, h, m, l),
-        inputs=[text_input, audio_input, state_history, current_mood, llm_internal_history],
-        outputs=[chatbot, state_history, llm_internal_history, last_base_reply, last_ft_reply]
-    )
-
-    # Preference Logging Functions
-    def handle_base_preference(base, ft, mood):
-        log_preference("Interaction", mood, "ab_test", base, ft, "base")
-        return gr.update(value="✅ Recorded: Prefer Base Model", visible=True)
-
-    def handle_ft_preference(base, ft, mood):
-        log_preference("Interaction", mood, "ab_test", base, ft, "finetuned")
-        return gr.update(value="✅ Recorded: Prefer MindCare AI", visible=True)
-
-    prefer_base_btn.click(
-        fn=handle_base_preference,
-        inputs=[last_base_reply, last_ft_reply, current_mood],
-        outputs=[pref_status]
-    )
-    
-    prefer_ft_btn.click(
-        fn=handle_ft_preference,
-        inputs=[last_base_reply, last_ft_reply, current_mood],
-        outputs=[pref_status]
+    audio_input.change(
+        fn=handle_audio_upload,
+        inputs=[audio_input, chatbot, llm_internal_history],
+        outputs=[chatbot, llm_internal_history, last_reply]
+    ).then(
+        fn=lambda: None, 
+        inputs=None,
+        outputs=[audio_input]
     )
 
 # Launch Logic
