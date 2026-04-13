@@ -1,1 +1,0 @@
-# MindCare modules package
