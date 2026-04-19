@@ -184,16 +184,22 @@ def process_chat_single_model(text, audio_path, history, llm_history_state):
         yield history, llm_history_state, ""
         return
 
-    # 1. Determine User Text
+    # 1. Determine User Text & Emotion Concurrently
     user_text = text
+    ft_emotion = "unknown"
     original_audio_path = None
 
     if audio_path and not text:
         original_audio_path = audio_path
         try:
-            print(f"[DEBUG APP] Starting speech_to_text for: {audio_path}")
-            user_text = speech_to_text(audio_path)
-            print(f"[DEBUG APP] Transcribed text: {user_text}")
+            print(f"[DEBUG APP] Starting concurrent audio processing for: {audio_path}")
+            
+            # --- CONCURRENT PROCESSING START ---
+            from modules.pipelines.p import process_audio_concurrently
+            user_text, ft_emotion = process_audio_concurrently(audio_path)
+            # --- CONCURRENT PROCESSING END ---
+
+            print(f"[DEBUG APP] Transcribed text: {user_text}, Emotion: {ft_emotion}")
             if not user_text:
                 user_text = "[Could not understand audio]"
         except Exception as e:
@@ -223,14 +229,17 @@ def process_chat_single_model(text, audio_path, history, llm_history_state):
         current_llm_history = llm_history_state or []
         
         # --- Generate Response using p.py ---
+        # FIX: Pass the pre_computed_emotion (ft_emotion) to avoid re-computing it
         result_ft = process_chat_request(
             user_text=user_text,
             chat_history_list=current_llm_history,
-            audio_path=original_audio_path
+            audio_path=original_audio_path,
+            pre_computed_emotion=ft_emotion if ft_emotion != "unknown" else None
         )
         reply_ft = result_ft["reply"]
         ft_strategy = result_ft.get("strategy", "unknown")
-        ft_emotion = result_ft.get("emotion", "unknown")
+        # Update ft_emotion with the one returned from pipeline (in case it was recomputed or refined)
+        ft_emotion = result_ft.get("emotion", ft_emotion) 
         
     except Exception as e:
         print(f"Error in generation: {e}")

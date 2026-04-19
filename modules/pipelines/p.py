@@ -3,6 +3,7 @@ import re
 import threading
 import torch
 import torchaudio
+import concurrent.futures
 from transformers import (
     WhisperProcessor, WhisperForConditionalGeneration,
     Wav2Vec2Processor, Wav2Vec2ForSequenceClassification,
@@ -25,6 +26,38 @@ _DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 _WHISPER_SIZES = frozenset({"tiny", "base", "small", "medium", "large", "large-v2", "large-v3"})
 
+def process_audio_concurrently(audio_path):
+    """
+    Concurrently run Whisper (STT) and Wav2Vec2 (Emotion) on the same audio file.
+    Returns: (transcribed_text, emotion_label)
+    """
+    if not audio_path or not os.path.exists(audio_path):
+        return "[Audio File Not Found]", "neutral"
+
+    def run_stt():
+        try:
+            return speech_to_text(audio_path)
+        except Exception as e:
+            print(f"STT Error: {e}")
+            return "[STT Error]"
+
+    def run_emotion():
+        try:
+            return predict_emotion(audio_path, user_text=None) # Pass None as text initially
+        except Exception as e:
+            print(f"Emotion Error: {e}")
+            return "neutral"
+
+    # Use ThreadPoolExecutor to run both tasks in parallel
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        future_stt = executor.submit(run_stt)
+        future_emotion = executor.submit(run_emotion)
+        
+        # Wait for both to complete
+        text = future_stt.result()
+        emotion = future_emotion.result()
+        
+    return text, emotion
 
 def _env_flag(name: str) -> bool:
     return os.environ.get(name, "").lower() in ("1", "true", "yes")
@@ -487,7 +520,7 @@ def mindcare_pipeline(audio_path, chat_history=""):
         "reply": final_reply,
     }
 
-def process_chat_request(user_text: str, chat_history_list: list = None, audio_path: str = None):
+def process_chat_request(user_text: str, chat_history_list: list = None, audio_path: str = None, pre_computed_emotion: str = None):
 
     if chat_history_list is None:
         chat_history_list = []
@@ -511,7 +544,10 @@ def process_chat_request(user_text: str, chat_history_list: list = None, audio_p
         }
 
     # 2. Emotion Detection
-    if audio_path:
+    # FIX: Use the passed argument instead of an undefined variable
+    if pre_computed_emotion:
+        emotion = pre_computed_emotion
+    elif audio_path:
         emotion = predict_emotion(audio_path, user_text=user_text)
     else:
         emotion = infer_emotion_from_text(user_text)
